@@ -1,0 +1,19 @@
+services:
+  itpilot-frontend:
+    image: itpilot-frontend:3.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: itpilot-frontend
+    ports:
+      - "5174:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - itpilot-frontend-network
+    restart: unless-stopped
+
+networks:
+  itpilot-frontend-network:
+    name: itpilot-frontend-network
+    driver: bridge

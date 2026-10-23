@@ -1,0 +1,42 @@
+# Local secrets; keep the public configuration template.
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local databases, logs and generated evaluation output.
+data/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Python environments and caches.
+.venv/
+.venv-*/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Frontend dependencies and generated output.
+node_modules/
+dist/
+build/
+coverage/
+
+# Editor, operating system and temporary files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
+*~

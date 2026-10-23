@@ -1,0 +1,147 @@
+# ITPilot 企业 IT 服务 Agent — Docker Compose 服务编排
+# 三级记忆架构：Redis（工作记忆）+ ChromaDB（情景记忆 + 用户画像）
+
+services:
+
+  # ── Redis 缓存（工作记忆）────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: itpilot-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-itpilot123}
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - itpilot-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-itpilot123}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ChromaDB 向量数据库（情景记忆 + 用户画像）────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: itpilot-chromadb
+    ports:
+      - "8001:8000"
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=FALSE
+    volumes:
+      - chromadb-data:/chroma/chroma
+    restart: unless-stopped
+    networks:
+      - itpilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/heartbeat || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ── Prometheus 监控 ─────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: itpilot-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+    networks:
+      - itpilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ── ITPilot 主应用 ──────────────────────────────────────────────────────────
+  itpilot:
+    image: itpilot-app:3.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        ITPILOT_BUILD_ID: ${ITPILOT_BUILD_ID:-phase9-final-deployment-v1}
+    container_name: itpilot-app
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # 容器内固定值，覆盖 .env 中的本地路径
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-itpilot123}@redis:6379/0
+      - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
+      - KNOWLEDGE_COLLECTION_NAME=${KNOWLEDGE_COLLECTION_NAME:-itpilot_knowledge_base_v1}
+      - ITPILOT_BUILD_ID=${ITPILOT_BUILD_ID:-phase9-final-deployment-v1}
+      - EVAL_BASELINE_PATH=/app/data/eval/itpilot-baseline-v1.json
+      - ITPILOT_SKILLS_DIR=/app/skills
+      # 注册自定义指标；Prometheus 仍抓取 FastAPI 的 /metrics (8000)。
+      - PROMETHEUS_PORT=9000
+    volumes:
+      - ./data/chroma:/app/data/chroma
+      - ./data/eval:/app/data/eval
+      - ./skills:/app/skills
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - itpilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+  # ── Nginx 反向代理 ──────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: itpilot-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      itpilot:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - itpilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# ── 网络 ────────────────────────────────────────────────────────────────────
+networks:
+  itpilot-network:
+    name: itpilot-network
+    driver: bridge
+
+# ── 数据卷 ──────────────────────────────────────────────────────────────────
+volumes:
+  redis-data:
+  chromadb-data:
+  prometheus-data:
+  nginx-logs:

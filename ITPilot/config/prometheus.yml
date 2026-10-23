@@ -1,0 +1,26 @@
+# Prometheus 配置文件 — ITPilot 企业 IT 服务 Agent
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'itpilot'
+    environment: 'demo'
+
+rule_files:
+  - "alerts/*.yml"
+
+scrape_configs:
+  # ITPilot 主应用指标
+  - job_name: 'itpilot-app'
+    static_configs:
+      - targets: ['itpilot:8000']
+        labels:
+          service: 'itpilot'
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+
+  # Prometheus 自监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

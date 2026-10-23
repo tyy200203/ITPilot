@@ -1,0 +1,26 @@
+{
+  "suite_id": "itpilot-load-benchmark-v1",
+  "description": "ITPilot真实LLM端到端混合负载，按技术40%、权限25%、通用20%、跨域协作15%配置。",
+  "prompts": [
+    {"category":"technical","message":"VPN连接时提示691，请给出排查步骤"},
+    {"category":"technical","message":"办公电脑启动后一直黑屏，应该怎么处理"},
+    {"category":"technical","message":"无线网络连接成功但无法访问内部站点"},
+    {"category":"technical","message":"桌面客户端打开后立即崩溃并提示0x80070005"},
+    {"category":"technical","message":"打印机显示脱机，重新连接后仍不能打印"},
+    {"category":"technical","message":"需要在公司电脑安装最新版Office"},
+    {"category":"technical","message":"登录应用持续返回401错误，如何排查"},
+    {"category":"technical","message":"外接显示器频繁闪烁并偶尔无信号"},
+    {"category":"permission","message":"请说明申请GitLab只读权限需要提供哪些信息"},
+    {"category":"permission","message":"新员工还没有企业邮箱账号，应该如何申请"},
+    {"category":"permission","message":"收到异地登录提醒后应该如何保护企业账号"},
+    {"category":"permission","message":"员工转岗后需要调整数据平台访问范围"},
+    {"category":"permission","message":"企业账号被冻结了，需要准备什么信息处理"},
+    {"category":"general","message":"IT服务台目前能够处理哪些类型的问题"},
+    {"category":"general","message":"请介绍提交IT服务请求的一般流程"},
+    {"category":"general","message":"服务台周末是否有人值班"},
+    {"category":"general","message":"刚才的说明很清楚，谢谢你的帮助"},
+    {"category":"collaboration","message":"VPN客户端报错691，同时还没有项目系统访问权限"},
+    {"category":"collaboration","message":"新员工需要创建企业邮箱，而且办公电脑无法启动"},
+    {"category":"collaboration","message":"申请测试环境权限，同时配套软件安装一直失败"}
+  ]
+}
