@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -68,13 +69,21 @@ class ToolStats:
 
 # ── 熔断器 ────────────────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class _CircuitPermit:
+    generation: int
+    probe: bool = False
+
+
 class CircuitBreaker:
     """
     三态熔断器：CLOSED → OPEN → HALF_OPEN → CLOSED
 
     连续失败 failure_threshold 次后打开；
     打开 recovery_s 秒后进入 HALF_OPEN 探测；
-    探测成功则关闭，失败则重新打开。
+    同一进程内仅允许一个半开探测；探测成功则关闭，失败或取消则重新等待恢复。
+    调用方应将 acquire() 返回的凭证传回，以忽略旧状态下在途请求的结果。
+    不提供跨进程协调。
     """
 
     def __init__(self, failure_threshold: int = 5, recovery_s: float = 60.0):
@@ -83,27 +92,59 @@ class CircuitBreaker:
         self.state       = CircuitState.CLOSED
         self.fail_count  = 0
         self.opened_at:  Optional[float] = None
+        self._generation = 0
+        self._lock = threading.Lock()
 
     def allow(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if time.monotonic() - self.opened_at >= self.recovery_s:  # type: ignore
+        """兼容布尔检查；实际执行链使用 acquire() 保留调用凭证。"""
+        return self.acquire() is not None
+
+    def acquire(self) -> Optional[_CircuitPermit]:
+        with self._lock:
+            if self.state == CircuitState.CLOSED:
+                return _CircuitPermit(self._generation)
+            if self.state == CircuitState.OPEN:
+                if self.opened_at is None or time.monotonic() - self.opened_at < self.recovery_s:
+                    return None
                 self.state = CircuitState.HALF_OPEN
-                return True
-            return False
-        return True  # HALF_OPEN：放行一次探测
+                self._generation += 1
+                return _CircuitPermit(self._generation, probe=True)
+            return None  # 已有探测在途，拒绝其他请求。
 
-    def record_success(self) -> None:
-        self.fail_count = 0
-        self.state = CircuitState.CLOSED
+    def record_success(self, permit: Optional[_CircuitPermit] = None) -> None:
+        with self._lock:
+            if permit is not None and permit.generation != self._generation:
+                return
+            if self.state == CircuitState.OPEN:
+                return
+            self.fail_count = 0
+            if self.state == CircuitState.HALF_OPEN:
+                self._generation += 1
+            self.state = CircuitState.CLOSED
+            self.opened_at = None
 
-    def record_failure(self) -> None:
-        self.fail_count += 1
-        if self.fail_count >= self.threshold:
-            self.state     = CircuitState.OPEN
-            self.opened_at = time.monotonic()
-            logger.warning(f"熔断器打开（连续失败 {self.fail_count} 次）")
+    def record_failure(self, permit: Optional[_CircuitPermit] = None) -> None:
+        with self._lock:
+            if permit is not None and permit.generation != self._generation:
+                return
+            if self.state == CircuitState.OPEN:
+                return
+            self.fail_count += 1
+            if self.state == CircuitState.HALF_OPEN or self.fail_count >= self.threshold:
+                self._open()
+                logger.warning(f"熔断器打开（连续失败 {self.fail_count} 次）")
+
+    def record_cancelled(self, permit: _CircuitPermit) -> None:
+        """未完成的探测重新进入冷却；普通请求取消不计为工具故障。"""
+        with self._lock:
+            if permit.probe and permit.generation == self._generation and self.state == CircuitState.HALF_OPEN:
+                self._open()
+
+    def _open(self) -> None:
+        """调用方必须持有 _lock。"""
+        self.state = CircuitState.OPEN
+        self.opened_at = time.monotonic()
+        self._generation += 1
 
 
 # ── 工具定义 ──────────────────────────────────────────────────────────────────
@@ -189,7 +230,8 @@ class MCPToolManager:
                 )
 
         # 熔断检查
-        if not tool.breaker.allow():
+        permit = tool.breaker.acquire()
+        if permit is None:
             error = f"工具熔断中: {name}，请稍后重试"
             return await self._fallback_result(tool, params, context, error)
 
@@ -205,7 +247,7 @@ class MCPToolManager:
             tool.stats.success += 1
             tool.stats.consecutive_fails = 0
             tool.stats.total_latency_ms += latency
-            tool.breaker.record_success()
+            tool.breaker.record_success(permit)
 
             # 重排（针对返回列表的检索工具）
             reranked = False
@@ -223,16 +265,20 @@ class MCPToolManager:
         except asyncio.TimeoutError:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
-            tool.breaker.record_failure()
+            tool.breaker.record_failure(permit)
             logger.error(f"工具超时: {name} ({tool.timeout_s}s)")
             return await self._fallback_result(tool, params, context, "执行超时")
 
         except Exception as ex:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
-            tool.breaker.record_failure()
+            tool.breaker.record_failure(permit)
             logger.error(f"工具异常: {name} — {ex}")
             return await self._fallback_result(tool, params, context, str(ex))
+        finally:
+            # CancelledError 不属于 Exception；取消仍向上传播，但不能遗留探测占用。
+            # 正常成功/失败已推进状态版本，这里不会覆盖已完成的结果。
+            tool.breaker.record_cancelled(permit)
 
     async def _fallback_result(
         self,
