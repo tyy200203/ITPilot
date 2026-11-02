@@ -55,6 +55,7 @@ class ToolStats:
     total:              int = 0
     success:            int = 0
     failed:             int = 0
+    validation_failed:  int = 0
     total_latency_ms:   float = 0.0
     consecutive_fails:  int = 0
 
@@ -206,11 +207,18 @@ class MCPToolManager:
     ) -> ToolResult:
         """
         调用工具，完整执行链：
-          缓存检查 → 熔断检查 → 参数校验 → 执行（含超时）→ 可选重排 → 缓存写入
+          参数校验 → 缓存检查 → 熔断检查 → 执行（含超时）→ 可选重排 → 缓存写入
         """
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
+
+        # 调用方输入错误不是工具故障，也不能占用半开状态的探测资格。
+        try:
+            self._validate_params(tool, params)
+        except ValueError as ex:
+            tool.stats.validation_failed += 1
+            return ToolResult(success=False, data=None, tool_name=name, error=str(ex))
 
         cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and tool.supports_rerank else 0
 
@@ -238,9 +246,6 @@ class MCPToolManager:
         t0 = time.monotonic()
         tool.stats.total += 1
         try:
-            # 参数校验（根据 JSON Schema 的 required 和 properties.type）
-            self._validate_params(tool, params)
-
             data = await asyncio.wait_for(self._run_handler(tool, params, context), timeout=tool.timeout_s)
             latency = (time.monotonic() - t0) * 1000
 
@@ -493,6 +498,8 @@ class MCPToolManager:
 
     def _validate_params(self, tool: Tool, params: Dict[str, Any]) -> None:
         """根据工具的 JSON Schema 校验参数，不合法时抛出 ValueError。"""
+        if not isinstance(params, dict):
+            raise ValueError(f"工具 {tool.name} 参数必须是对象")
         schema = tool.schema
         required = schema.get("required", [])
         properties = schema.get("properties", {})
@@ -505,7 +512,10 @@ class MCPToolManager:
             if key in properties:
                 expected_type = properties[key].get("type")
                 if expected_type and expected_type in self._TYPE_MAP:
-                    if not isinstance(value, self._TYPE_MAP[expected_type]):
+                    valid = isinstance(value, self._TYPE_MAP[expected_type])
+                    if expected_type in {"integer", "number"} and isinstance(value, bool):
+                        valid = False
+                    if not valid:
                         raise ValueError(
                             f"工具 {tool.name} 参数 {key} 类型错误: 期望 {expected_type}，实际 {type(value).__name__}"
                         )
@@ -528,6 +538,7 @@ class MCPToolManager:
                 "success_rate": round(t.stats.success_rate, 3),
                 "avg_latency_ms": round(t.stats.avg_latency_ms, 1),
                 "consecutive_fails": t.stats.consecutive_fails,
+                "validation_failed": t.stats.validation_failed,
                 "circuit_state": t.breaker.state.value,
             }
             for name, t in self._tools.items()
