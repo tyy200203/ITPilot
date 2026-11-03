@@ -405,12 +405,21 @@ class MCPToolManager:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 3. 合并去重（按内容哈希去重）
+        # 3. 优先按知识库片段 ID 去重，避免同一片段因查询分数不同而重复。
         seen, merged = set(), []
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
+                    if isinstance(item, dict):
+                        chunk_id = item.get("chunk_id")
+                        if chunk_id:
+                            key = ("chunk_id", str(chunk_id))
+                        else:
+                            stable_item = {k: v for k, v in item.items() if k != "score"}
+                            key = ("content", json.dumps(stable_item, sort_keys=True,
+                                                         ensure_ascii=False, default=str))
+                    else:
+                        key = ("value", str(item))
                     if key not in seen:
                         seen.add(key)
                         merged.append(item)

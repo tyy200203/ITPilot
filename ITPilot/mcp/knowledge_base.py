@@ -128,12 +128,14 @@ class KnowledgeBase:
 
         items = []
         if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
+            for chunk_id, doc, meta, dist in zip(
+                results["ids"][0],
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
                 items.append({
+                    "chunk_id": str(chunk_id),
                     "title":    meta.get("title", ""),
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度

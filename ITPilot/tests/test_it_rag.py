@@ -2,7 +2,7 @@ import asyncio
 import json
 
 from mcp.knowledge_base import KnowledgeBase
-from mcp.tool_manager import MCPToolManager
+from mcp.tool_manager import MCPToolManager, ToolResult
 
 
 class _CaptureCollection:
@@ -129,6 +129,68 @@ def test_stats_proves_active_collection_and_actual_document_titles():
         "total_chunks": 2,
         "document_titles": ["GitLab 与内部系统权限申请", "VPN 常见错误码排查"],
     }
+
+
+def test_knowledge_search_returns_chroma_chunk_id():
+    class _QueryCollection:
+        def query(self, *, query_texts, n_results):
+            assert query_texts == ["VPN 691"]
+            assert n_results == 5
+            return {
+                "ids": [["vpn-chunk-1"]],
+                "documents": [["检查账号状态"]],
+                "metadatas": [[{"title": "VPN 排查", "chunk_index": 0}]],
+                "distances": [[0.2]],
+            }
+
+    kb = object.__new__(KnowledgeBase)
+    kb._collection = _QueryCollection()
+
+    assert kb.search("VPN 691") == [{
+        "chunk_id": "vpn-chunk-1",
+        "title": "VPN 排查",
+        "content": "检查账号状态",
+        "score": 0.8,
+        "chunk": 0,
+    }]
+
+
+def test_rewrite_search_deduplicates_by_chunk_id_even_when_scores_differ():
+    manager = MCPToolManager(api_key="test-key")
+    recalled = {
+        "原始问题": [
+            {"chunk_id": "chunk-1", "title": "VPN", "content": "检查账号", "score": 0.9},
+            {"chunk_id": "chunk-2", "title": "VPN", "content": "检查账号", "score": 0.7},
+            {"title": "DNS", "content": "检查网络", "score": 0.6},
+        ],
+        "改写问题": [
+            {"chunk_id": "chunk-1", "title": "VPN", "content": "检查账号", "score": 0.5},
+            {"title": "DNS", "content": "检查网络", "score": 0.4},
+        ],
+    }
+    rerank_input = []
+
+    async def rewrite_query(query, n):
+        assert (query, n) == ("原始问题", 3)
+        return list(recalled)
+
+    async def call(tool_name, params, context, use_cache):
+        assert tool_name == "knowledge_search"
+        return ToolResult(success=True, data=recalled[params["query"]], tool_name=tool_name)
+
+    async def rerank(query, items, top_k):
+        rerank_input.extend(items)
+        return items[:top_k]
+
+    manager.rewrite_query = rewrite_query
+    manager.call = call
+    manager._rerank = rerank
+
+    result = asyncio.run(manager.search_with_rewrite("knowledge_search", "原始问题"))
+
+    assert result.success is True
+    assert rerank_input == recalled["原始问题"]
+    assert result.data == rerank_input
 
 
 def test_rewrite_query_limits_and_cleans_model_output():
