@@ -27,7 +27,7 @@ Set-Location .\ITPilot
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-编辑本地 `.env`，填写自己的模型配置与 Redis 密码。模型端点须支持 Anthropic Messages 协议。随后运行：
+编辑本地 `.env`，填写模型配置、Redis 密码，以及分别用于普通用户和管理操作的随机 API 令牌。模型端点须支持 Anthropic Messages 协议；令牌格式见[后端 README](ITPilot/README.md)。随后运行：
 
 ```powershell
 docker compose up -d --build
@@ -47,7 +47,7 @@ npm run build
 docker compose up -d --build
 ```
 
-访问 [http://localhost:5174](http://localhost:5174)。前端 Dockerfile 使用本地生成的 `dist/`，因此必须先完成 `npm run build`。开发模式与代理配置见[前端 README](ITPilotFrontend/README.md)。
+访问 [http://localhost:5174](http://localhost:5174)，在“连接配置”填写 `.env` 中对应的用户令牌；需要知识导入、Skills 管理或评测时，再填写管理员令牌。前端 Dockerfile 使用本地生成的 `dist/`，因此必须先完成 `npm run build`。开发模式与代理配置见[前端 README](ITPilotFrontend/README.md)。
 
 ## 测试与评测
 

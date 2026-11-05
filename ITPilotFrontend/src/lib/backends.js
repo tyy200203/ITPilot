@@ -9,10 +9,13 @@ const DEFAULT_BACKENDS = {
 
 export function createInitialSettings() {
   const saved = readSettings()
+  const auth = readAuth()
   return {
     backend: 'python',
     userId: saved.userId || 'u1001',
     conversationId: saved.conversationId || '',
+    userToken: auth.userToken || '',
+    adminToken: auth.adminToken || '',
     endpoints: {
       python: saved.endpoints?.python || DEFAULT_BACKENDS.python.baseUrl
     }
@@ -20,7 +23,9 @@ export function createInitialSettings() {
 }
 
 export function saveSettings(settings) {
-  localStorage.setItem('itpilot.frontend.settings', JSON.stringify(settings))
+  const { userToken, adminToken, ...publicSettings } = settings
+  localStorage.setItem('itpilot.frontend.settings', JSON.stringify(publicSettings))
+  sessionStorage.setItem('itpilot.frontend.auth', JSON.stringify({ userToken, adminToken }))
 }
 
 export function backendMeta(type, settings) {
@@ -36,38 +41,37 @@ export async function requestHealth(type, settings) {
 }
 
 export async function requestMonitor(type, settings) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/monitor')
+  return authenticatedRequest(type, settings, '/monitor', {}, 'admin')
 }
 
 export async function requestSkills(type, settings) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/skills')
+  return authenticatedRequest(type, settings, '/skills', {}, 'admin')
 }
 
 export async function reloadSkills(type, settings) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/skills/reload', { method: 'POST' })
+  return authenticatedRequest(type, settings, '/skills/reload', { method: 'POST' }, 'admin')
 }
 
 export async function requestKnowledgeStats(type, settings) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/knowledge/stats')
+  return authenticatedRequest(type, settings, '/knowledge/stats')
 }
 
 export async function runEvaluation(type, settings, body = null) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/eval/run', {
+  return authenticatedRequest(type, settings, '/eval/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined
-  })
+  }, 'admin')
 }
 
 export async function requestSearch(type, settings, query, topK = 5) {
   const params = new URLSearchParams({ query, top_k: String(topK) })
-  return requestJson(backendMeta(type, settings).baseUrl, `/search?${params}`, { method: 'POST' })
+  return authenticatedRequest(type, settings, `/search?${params}`, { method: 'POST' })
 }
 
 export async function requestChat(type, settings, message) {
-  const meta = backendMeta(type, settings)
   const payload = buildChatPayload(type, settings, message)
-  const raw = await requestJson(meta.baseUrl, '/chat', {
+  const raw = await authenticatedRequest(type, settings, '/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -76,7 +80,7 @@ export async function requestChat(type, settings, message) {
 }
 
 export async function archiveConversation(type, settings, userId, conversationId) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/conversation/archive', {
+  return authenticatedRequest(type, settings, '/conversation/archive', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -88,25 +92,25 @@ export async function archiveConversation(type, settings, userId, conversationId
 
 export async function requestToolTrace(type, settings, requestId) {
   if (!requestId) return null
-  const raw = await requestJson(backendMeta(type, settings).baseUrl, `/trace/tool/${encodeURIComponent(requestId)}`)
+  const raw = await authenticatedRequest(type, settings, `/trace/tool/${encodeURIComponent(requestId)}`)
   return normalizeToolTraceResponse(raw)
 }
 
 export async function addKnowledge(type, settings, documents) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/knowledge/add', {
+  return authenticatedRequest(type, settings, '/knowledge/add', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ documents })
-  })
+  }, 'admin')
 }
 
 export async function uploadKnowledge(type, settings, file) {
   const form = new FormData()
   form.append('file', file)
-  return requestJson(backendMeta(type, settings).baseUrl, '/knowledge/upload', {
+  return authenticatedRequest(type, settings, '/knowledge/upload', {
     method: 'POST',
     body: form
-  })
+  }, 'admin')
 }
 
 function buildChatPayload(type, settings, message) {
@@ -174,6 +178,17 @@ async function requestJson(baseUrl, path, options = {}) {
   return data
 }
 
+function authenticatedRequest(type, settings, path, options = {}, scope = 'user') {
+  const token = scope === 'admin' ? settings.adminToken : settings.userToken
+  return requestJson(backendMeta(type, settings).baseUrl, path, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    }
+  })
+}
+
 function normalizeBaseUrl(value) {
   return String(value || '').replace(/\/+$/, '')
 }
@@ -183,6 +198,14 @@ function readSettings() {
     const current = localStorage.getItem('itpilot.frontend.settings')
     const legacy = localStorage.getItem('echomind.frontend.settings')
     return JSON.parse(current || legacy || '{}')
+  } catch {
+    return {}
+  }
+}
+
+function readAuth() {
+  try {
+    return JSON.parse(sessionStorage.getItem('itpilot.frontend.auth') || '{}')
   } catch {
     return {}
   }

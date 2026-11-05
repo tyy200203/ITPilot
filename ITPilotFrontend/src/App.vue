@@ -141,6 +141,14 @@
                 <input v-model="settings.userId" @change="persist" placeholder="u1001" />
               </label>
               <label>
+                <span>用户令牌（对话、检索）</span>
+                <input v-model="settings.userToken" @change="persist" type="password" autocomplete="off" placeholder="与后端配置的用户 ID 对应" />
+              </label>
+              <label>
+                <span>管理员令牌（知识导入、评测）</span>
+                <input v-model="settings.adminToken" @change="persist" type="password" autocomplete="off" placeholder="仅本机管理时填写" />
+              </label>
+              <label>
                 <span>会话 ID</span>
                 <input v-model="settings.conversationId" @change="persist" placeholder="自动生成" />
               </label>

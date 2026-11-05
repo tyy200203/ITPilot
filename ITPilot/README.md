@@ -30,7 +30,23 @@ ITPilot 面向企业内部设备、网络、软件、账号权限和 IT 工单�
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-编辑 `.env`，至少填写 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL` 和 `REDIS_PASSWORD`。使用第三方兼容服务时，还需填写该服务的 **Anthropic Messages 兼容地址** `ANTHROPIC_BASE_URL`；OpenAI Chat Completions 地址不能直接填入此变量。不要提交 `.env` 或把密钥展示在截图中。
+编辑 `.env`，至少填写 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`、`REDIS_PASSWORD`、`ITPILOT_USER_TOKENS` 和 `ITPILOT_ADMIN_TOKEN`。用户令牌配置为 JSON 对象，例如 `{"u1001":"<独立随机令牌>"}`；管理员使用另一枚随机令牌。令牌须为不少于 24 字符的字母、数字、`_` 或 `-`，启动时会拒绝缺失、占位或重复的令牌。使用第三方兼容服务时，还需填写该服务的 **Anthropic Messages 兼容地址** `ANTHROPIC_BASE_URL`；OpenAI Chat Completions 地址不能直接填入此变量。不要提交 `.env` 或把密钥展示在截图中。
+
+可在 PowerShell 中运行下面的命令两次，分别生成用户和管理员令牌，再填入本地 `.env`：
+
+```powershell
+$bytes = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($bytes)
+([BitConverter]::ToString($bytes) -replace '-', '').ToLower()
+$rng.Dispose()
+```
+
+## 访问控制
+
+业务 API 使用 `Authorization: Bearer <令牌>`；`/health`、供 Prometheus 抓取的 `/metrics` 以及交互式 API 文档仍可公开访问。`ITPILOT_USER_TOKENS` 中的用户令牌可用于对话、会话归档、检索、知识统计和本人请求的工具 Trace；请求中的 `user_id` 必须与令牌绑定的用户一致，省略时由服务端确定。管理员令牌用于知识导入、Skills 查看与重载、运行监控、最近 Trace 列表及评测。管理员令牌不能代替用户令牌进行对话。
+
+前端“连接配置”中分别填写用户令牌与管理员令牌。令牌只保存在当前浏览器标签的 `sessionStorage`，不会写进前端的长期设置；关闭标签后需重新填写。多人使用或跨网络部署时应配置 HTTPS，并按实际前端地址设置 `ITPILOT_CORS_ORIGINS`。不要将管理员令牌提供给普通用户。
 
 ## 启动与验收
 
@@ -52,7 +68,7 @@ Invoke-RestMethod http://localhost:8000/health
 | 后端 Nginx 代理 | `http://localhost:8080` |
 | Prometheus | `http://localhost:9090` |
 
-Redis 和 ChromaDB 分别映射宿主机端口 `6379`、`8001`。它们属于后端依赖，不是网页入口。前端在相邻的 `ITPilotFrontend` 目录中单独构建和启动，页面地址为 `http://localhost:5174`；参见[前端部署说明](../ITPilotFrontend/README.md)。
+Redis、ChromaDB 和 Prometheus 的宿主机端口仅绑定 `127.0.0.1`，分别为 `6379`、`8001`、`9090`；它们不是对外网页入口。Redis 密码必须在 `.env` 中显式设置。前端在相邻的 `ITPilotFrontend` 目录中单独构建和启动，页面地址为 `http://localhost:5174`；参见[前端部署说明](../ITPilotFrontend/README.md)。
 
 修改后端代码后，可运行 `./rebuild-itpilot.ps1` 重新构建应用容器并检查运行版本。该脚本不负责构建前端。停止服务使用 `docker compose down`；不要在仍需保留 Redis、ChromaDB 数据时添加 `-v`。
 
@@ -63,15 +79,15 @@ Redis 和 ChromaDB 分别映射宿主机端口 `6379`、`8001`。它们属于后
 | 接口 | 用途 |
 | --- | --- |
 | `GET /health` | 服务版本、构建与 Agent 状态 |
-| `POST /chat` | IT 问答与多 Agent 编排 |
+| `POST /chat` | IT 问答与多 Agent 编排（用户令牌） |
 | `POST /conversation/archive` | 归档当前会话 |
 | `POST /search` | 独立验证查询改写、并行召回与重排链路 |
-| `POST /knowledge/add`、`POST /knowledge/upload` | 导入文本或文件 |
+| `POST /knowledge/add`、`POST /knowledge/upload` | 导入文本或文件（管理员令牌） |
 | `GET /knowledge/stats` | 知识库集合与文档统计 |
 | `GET /skills`、`POST /skills/reload` | 查看或重载业务规范 |
 | `GET /trace/tool/{request_id}` | 查询单次请求的工具轨迹 |
 | `GET /monitor`、`GET /metrics` | 运行摘要与 Prometheus 指标入口 |
-| `POST /eval/run` | 运行意图及对话质量评测；调用模型可能产生费用 |
+| `POST /eval/run` | 运行意图及对话质量评测（管理员令牌）；调用模型可能产生费用 |
 
 知识库上传支持 `.txt`、`.md` 和包含 `title`、`content` 的 JSON 文档数组；单个上传文件限制为 10 MB。运行中的知识库默认会导入 IT 服务示例文档，已有数据保存在 ChromaDB 中，不会因重建应用容器自动清空。
 

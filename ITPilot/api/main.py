@@ -20,10 +20,11 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
+from api.auth import Principal, get_auth_config, require_admin, require_user
 
 load_dotenv()
 
@@ -76,6 +77,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
 
+    get_auth_config()  # Reject an unprotected deployment before initializing services.
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request, build_shared_rag_tools
@@ -213,7 +215,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[origin.strip() for origin in os.getenv(
+        "ITPILOT_CORS_ORIGINS",
+        "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174",
+    ).split(",") if origin.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -222,7 +227,7 @@ app.add_middleware(
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message:     str
-    user_id:     str = "anonymous"
+    user_id:     Optional[str] = None
     conv_id:     Optional[str] = None
 
 
@@ -248,7 +253,7 @@ class ChatResponse(BaseModel):
 
 
 class ConversationArchiveInput(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None
     conv_id: str
 
 
@@ -286,7 +291,7 @@ async def health():
 
 
 @app.get("/skills", tags=["Skills"])
-async def skills_summary():
+async def skills_summary(_: Principal = Depends(require_admin)):
     """查看当前已加载的 Skills，便于确认热加载结果和排查解析错误。"""
     if _skill_manager is None:
         raise HTTPException(503, "Skills 未初始化")
@@ -294,7 +299,7 @@ async def skills_summary():
 
 
 @app.post("/skills/reload", tags=["Skills"])
-async def reload_skills():
+async def reload_skills(_: Principal = Depends(require_admin)):
     """运行时重新扫描 Skill 目录，不需要重启服务。"""
     if _skill_manager is None:
         raise HTTPException(503, "Skills 未初始化")
@@ -305,13 +310,16 @@ async def reload_skills():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, principal: Principal = Depends(require_user)):
     """
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
     """
+    if req.user_id and req.user_id != principal.user_id:
+        raise HTTPException(403, "user_id does not match the authenticated user")
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
+    user_id = principal.user_id
 
     from agents.agent_orchestrator import Request as OrcReq
     from memory.conversation_memory import MsgRole
@@ -319,7 +327,7 @@ async def chat(req: ChatRequest):
     conv_id = req.conv_id or str(uuid.uuid4())
 
     # 1. 读取记忆上下文
-    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+    mem_ctx = await _memory.get_context(user_id, conv_id, query=req.message)
 
     # 2. 构建编排请求（含对话历史，用于意图识别上下文）
     history = [
@@ -332,7 +340,7 @@ async def chat(req: ChatRequest):
 
     orch_req = OrcReq(
         message=req.message,
-        user_id=req.user_id,
+        user_id=user_id,
         conv_id=conv_id,
         context=full_context,
         history=history,
@@ -347,11 +355,11 @@ async def chat(req: ChatRequest):
     result = await _orchestrator.run(orch_req)
 
     # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
+    await _memory.add_message(user_id, conv_id, MsgRole.USER, req.message)
+    await _memory.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
     # 5. 异步更新用户画像（不阻塞响应）
-    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+    asyncio.create_task(_memory.update_profile(user_id, conv_id))
 
     return ChatResponse(
         conv_id=conv_id,
@@ -376,17 +384,19 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/conversation/archive", tags=["会话"])
-async def archive_conversation(body: ConversationArchiveInput):
+async def archive_conversation(body: ConversationArchiveInput, principal: Principal = Depends(require_user)):
     """结束当前会话，并将尚未压缩的短会话归档到跨会话记忆。"""
+    if body.user_id and body.user_id != principal.user_id:
+        raise HTTPException(403, "user_id does not match the authenticated user")
+    if not body.conv_id.strip():
+        raise HTTPException(400, "conv_id 不能为空")
     if _memory is None:
         raise HTTPException(503, "记忆系统未初始化")
-    if not body.user_id.strip() or not body.conv_id.strip():
-        raise HTTPException(400, "user_id 和 conv_id 不能为空")
-    return await _memory.archive_conversation(body.user_id, body.conv_id)
+    return await _memory.archive_conversation(principal.user_id, body.conv_id)
 
 
 @app.get("/monitor")
-async def monitor_summary():
+async def monitor_summary(_: Principal = Depends(require_admin)):
     """实时监控摘要：Agent 成功率、工具统计、告警、优化建议。"""
     if _monitor is None:
         raise HTTPException(503, "服务未就绪")
@@ -394,11 +404,13 @@ async def monitor_summary():
 
 
 @app.get("/trace/tool/{request_id}", response_model=ToolTraceResponse)
-async def get_tool_trace(request_id: str):
+async def get_tool_trace(request_id: str, principal: Principal = Depends(require_user)):
     """查看某次请求的工具调用明细。"""
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
     trace = _orchestrator.get_tool_trace(request_id)
+    if trace is not None and trace.get("user_id") != principal.user_id:
+        trace = None
     return ToolTraceResponse(
         request_id=request_id,
         found=trace is not None,
@@ -407,7 +419,7 @@ async def get_tool_trace(request_id: str):
 
 
 @app.get("/trace/tools", response_model=RecentToolTracesResponse)
-async def list_recent_tool_traces(limit: int = 20):
+async def list_recent_tool_traces(limit: int = 20, _: Principal = Depends(require_admin)):
     """查看最近 N 次请求的工具调用明细。"""
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
@@ -421,7 +433,7 @@ async def prometheus_metrics():
 
 
 @app.post("/search")
-async def search(query: str, top_k: int = 5):
+async def search(query: str, top_k: int = 5, _: Principal = Depends(require_user)):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
     展示 MCP 工具调用的核心亮点。
@@ -465,7 +477,7 @@ class EvalRunInput(BaseModel):
 
 
 @app.post("/knowledge/add", tags=["知识库"])
-async def add_knowledge(body: BatchDocInput):
+async def add_knowledge(body: BatchDocInput, _: Principal = Depends(require_admin)):
     """
     批量导入文档到知识库。
 
@@ -491,7 +503,7 @@ async def add_knowledge(body: BatchDocInput):
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
-async def upload_knowledge(file: UploadFile = File(...)):
+async def upload_knowledge(file: UploadFile = File(...), _: Principal = Depends(require_admin)):
     """
     上传文件导入知识库。
 
@@ -536,7 +548,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
 
 
 @app.get("/knowledge/stats", tags=["知识库"])
-async def knowledge_stats():
+async def knowledge_stats(_: Principal = Depends(require_user)):
     """查看当前实际知识库的集合名、语料版本、片段数和文档标题。"""
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
@@ -552,7 +564,7 @@ async def knowledge_stats():
 
 
 @app.post("/eval/run")
-async def run_eval(body: Optional[EvalRunInput] = None):
+async def run_eval(body: Optional[EvalRunInput] = None, _: Principal = Depends(require_admin)):
     """运行内置评测用例，返回评测报告。"""
     if _evaluator is None:
         raise HTTPException(503, "服务未就绪")

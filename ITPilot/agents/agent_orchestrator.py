@@ -755,9 +755,10 @@ class AgentOrchestrator:
         """对外暴露意图识别，供 API 层先判断是否需要 RAG 等前置能力。"""
         return await self._intent_recognizer.recognize(message, history=history)
 
-    def _record_tool_trace(self, result: OrchestratorResult) -> None:
+    def _record_tool_trace(self, result: OrchestratorResult, user_id: str) -> None:
         trace = {
             "request_id": result.request_id,
+            "user_id": user_id,
             "timestamp": datetime.now().isoformat(),
             "intent": result.intent.value if result.intent else None,
             "primary_agent": result.primary_agent.value if result.primary_agent else None,
@@ -811,7 +812,7 @@ class AgentOrchestrator:
                 routing_reason="低置信度 OTHER 意图，先澄清用户需求",
                 routing_confidence=req.intent_confidence,
             )
-            self._record_tool_trace(result)
+            self._record_tool_trace(result, req.user_id)
             return result
 
         # 复杂问题自动并行协作，例如同一句同时涉及 VPN 故障和权限申请。
@@ -847,7 +848,7 @@ class AgentOrchestrator:
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
         )
-        self._record_tool_trace(result)
+        self._record_tool_trace(result, req.user_id)
         return result
 
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
@@ -891,7 +892,7 @@ class AgentOrchestrator:
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
         )
-        self._record_tool_trace(result)
+        self._record_tool_trace(result, req.user_id)
         return result
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
