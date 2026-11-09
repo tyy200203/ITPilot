@@ -56,6 +56,25 @@ export async function requestKnowledgeStats(type, settings) {
   return authenticatedRequest(type, settings, '/knowledge/stats')
 }
 
+export async function listKnowledgeDocuments(type, settings) {
+  return authenticatedRequest(type, settings, '/knowledge/documents', {}, 'admin')
+}
+
+export async function getKnowledgeDocument(type, settings, documentId) {
+  return authenticatedRequest(type, settings, `/knowledge/documents/${encodeURIComponent(documentId)}`, {}, 'admin')
+}
+
+export async function updateKnowledgeDocument(type, settings, documentId, document) {
+  return authenticatedRequest(type, settings, `/knowledge/documents/${encodeURIComponent(documentId)}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(document)
+  }, 'admin')
+}
+
+export async function deleteKnowledgeDocument(type, settings, documentId) {
+  return authenticatedRequest(type, settings, `/knowledge/documents/${encodeURIComponent(documentId)}`,
+    { method: 'DELETE' }, 'admin')
+}
+
 export async function runEvaluation(type, settings, body = null) {
   return authenticatedRequest(type, settings, '/eval/run', {
     method: 'POST',

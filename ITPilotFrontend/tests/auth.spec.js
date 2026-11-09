@@ -3,10 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   addKnowledge,
   createInitialSettings,
+  deleteKnowledgeDocument,
+  getKnowledgeDocument,
+  listKnowledgeDocuments,
   requestChat,
   requestHealth,
   requestToolTrace,
-  saveSettings
+  saveSettings,
+  updateKnowledgeDocument
 } from '../src/lib/backends'
 
 
@@ -46,5 +50,24 @@ describe('API credentials', () => {
     expect(calls[1][1].headers.Authorization).toBe('Bearer user-secret')
     expect(calls[2][1].headers.Authorization).toBe('Bearer user-secret')
     expect(calls[3][1].headers.Authorization).toBe('Bearer admin-secret')
+  })
+
+  it('uses the admin token and document id for document management', async () => {
+    const settings = { ...createInitialSettings(), userToken: 'user-secret', adminToken: 'admin-secret' }
+    await listKnowledgeDocuments('python', settings)
+    await getKnowledgeDocument('python', settings, 'doc/1')
+    await updateKnowledgeDocument('python', settings, 'doc/1', { title: 'VPN', content: '新版' })
+    await deleteKnowledgeDocument('python', settings, 'doc/1')
+
+    const calls = fetch.mock.calls
+    expect(calls.map(([url]) => url)).toEqual([
+      '/api/python/knowledge/documents',
+      '/api/python/knowledge/documents/doc%2F1',
+      '/api/python/knowledge/documents/doc%2F1',
+      '/api/python/knowledge/documents/doc%2F1'
+    ])
+    expect(calls.map(([, options]) => options.headers.Authorization)).toEqual(Array(4).fill('Bearer admin-secret'))
+    expect(calls[2][1].method).toBe('PUT')
+    expect(calls[3][1].method).toBe('DELETE')
   })
 })

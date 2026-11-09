@@ -247,8 +247,12 @@
           <div><dt>Documents</dt><dd>{{ knowledgeStats.document_titles?.length || 0 }}</dd></div>
           <div><dt>Build</dt><dd>{{ healthData.build_id || '-' }}</dd></div>
         </dl>
-        <div v-if="knowledgeStats.document_titles?.length" class="document-title-list">
-          <span v-for="title in knowledgeStats.document_titles" :key="title">{{ title }}</span>
+        <div v-if="knowledgeDocuments.length" class="document-title-list">
+          <span v-for="item in knowledgeDocuments" :key="item.document_id">
+            {{ item.title }} · 状态：{{ item.status === 'active' ? '有效' : item.status }} · {{ item.chunk_count }} 片段 · 版本 {{ item.version.slice(0, 8) }}
+            <button class="link-button" :disabled="busy" @click="selectKnowledgeDocument(item)">编辑</button>
+            <button class="link-button" :disabled="busy" @click="removeKnowledgeDocument(item)">删除</button>
+          </span>
         </div>
       </section>
 
@@ -276,13 +280,14 @@
 
         <section class="workspace-card import-workspace">
           <div class="card-heading">
-            <div><span class="kicker">Ingestion</span><h2>添加知识</h2></div>
+            <div><span class="kicker">Ingestion</span><h2>{{ editingDocumentId ? '更新知识' : '添加知识' }}</h2></div>
             <code>ChromaDB</code>
           </div>
-          <label><span>标题</span><input v-model="docTitle" placeholder="公司 VPN 故障处理规范" /></label>
+          <label><span>标题</span><input v-model="docTitle" :readonly="!!editingDocumentId" placeholder="公司 VPN 故障处理规范" /></label>
           <label><span>内容</span><textarea v-model="docContent" rows="7" placeholder="输入 IT 服务规范、权限流程或排障步骤"></textarea></label>
           <div class="side-actions">
-            <button @click="submitKnowledge" :disabled="busy || !docTitle.trim() || !docContent.trim()">添加文档</button>
+            <button @click="submitKnowledge" :disabled="busy || !docTitle.trim() || !docContent.trim()">{{ editingDocumentId ? '保存更新' : '添加文档' }}</button>
+            <button v-if="editingDocumentId" class="quiet-button" @click="cancelKnowledgeEdit">取消编辑</button>
             <label class="upload-button">上传文件<input type="file" accept=".txt,.md,.json" @change="handleUpload" /></label>
           </div>
         </section>
@@ -384,12 +389,16 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import {
   addKnowledge,
   archiveConversation,
+  deleteKnowledgeDocument,
   backendMeta,
   createInitialSettings,
   reloadSkills,
   requestChat,
   requestHealth,
   requestKnowledgeStats,
+  listKnowledgeDocuments,
+  getKnowledgeDocument,
+  updateKnowledgeDocument,
   requestMonitor,
   requestSearch,
   requestToolTrace,
@@ -410,6 +419,8 @@ const healthData = ref({})
 const statusText = ref('')
 const knowledgeCount = ref('-')
 const knowledgeStats = ref({ collection_name: '', corpus_id: '', total_chunks: null, document_titles: [] })
+const knowledgeDocuments = ref([])
+const editingDocumentId = ref('')
 const searchQuery = ref('VPN 错误 691 怎么处理')
 const searchResults = ref([])
 const docTitle = ref('公司 VPN 故障处理规范')
@@ -462,7 +473,15 @@ function updateSidebarHeight() {
 }
 
 async function refreshConsole() {
-  await Promise.allSettled([checkHealth(), loadStats(), loadMonitor(), loadSkills()])
+  await Promise.allSettled([checkHealth(), loadStats(), loadDocuments(), loadMonitor(), loadSkills()])
+}
+
+async function loadDocuments() {
+  try {
+    knowledgeDocuments.value = (await listKnowledgeDocuments(settings.backend, settings)).documents || []
+  } catch {
+    knowledgeDocuments.value = []
+  }
 }
 
 async function checkHealth() {
@@ -604,10 +623,16 @@ async function searchKnowledge() {
 async function submitKnowledge() {
   busy.value = true
   try {
-    const data = await addKnowledge(settings.backend, settings, [{ title: docTitle.value.trim(), content: docContent.value.trim() }])
+    const doc = { title: docTitle.value.trim(), content: docContent.value.trim() }
+    const data = editingDocumentId.value
+      ? await updateKnowledgeDocument(settings.backend, settings, editingDocumentId.value, doc)
+      : await addKnowledge(settings.backend, settings, [doc])
     statusText.value = JSON.stringify(data, null, 2)
     await loadStats()
-    showToast('文档已添加')
+    await loadDocuments()
+    const outcome = data.status || data.documents?.[0]?.status
+    showToast(outcome === 'unchanged' ? '文档未变化' : outcome === 'updated' ? '文档已更新' : '文档已添加')
+    cancelKnowledgeEdit()
   } catch (error) {
     statusText.value = error.message
     showToast('文档导入失败')
@@ -623,10 +648,45 @@ async function handleUpload(event) {
     const data = await uploadKnowledge(settings.backend, settings, file)
     statusText.value = JSON.stringify(data, null, 2)
     await loadStats()
-    showToast(`${file.name} 导入成功`)
+    await loadDocuments()
+    showToast(data.documents?.every(item => item.status === 'unchanged') ? '文档未变化' : `${file.name} 导入成功`)
   } catch (error) {
     statusText.value = error.message
     showToast('文件导入失败')
+  } finally { busy.value = false }
+}
+
+async function selectKnowledgeDocument(item) {
+  busy.value = true
+  try {
+    const document = await getKnowledgeDocument(settings.backend, settings, item.document_id)
+    editingDocumentId.value = item.document_id
+    docTitle.value = document.title
+    docContent.value = document.content
+  } catch (error) {
+    statusText.value = error.message
+    showToast('读取文档失败')
+  } finally { busy.value = false }
+}
+
+function cancelKnowledgeEdit() {
+  editingDocumentId.value = ''
+  docTitle.value = ''
+  docContent.value = ''
+}
+
+async function removeKnowledgeDocument(item) {
+  if (!window.confirm(`确定删除“${item.title}”及其所有片段吗？`)) return
+  busy.value = true
+  try {
+    await deleteKnowledgeDocument(settings.backend, settings, item.document_id)
+    if (editingDocumentId.value === item.document_id) cancelKnowledgeEdit()
+    await loadStats()
+    await loadDocuments()
+    showToast('文档已删除')
+  } catch (error) {
+    statusText.value = error.message
+    showToast('删除失败')
   } finally { busy.value = false }
 }
 

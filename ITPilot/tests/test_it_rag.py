@@ -10,20 +10,46 @@ class _CaptureCollection:
         self.ids = []
         self.documents = []
         self.metadatas = []
+        self.metadata = {"seeded": "true"}
 
     def add(self, *, ids, documents, metadatas):
+        assert not set(ids) & set(self.ids)
         self.ids.extend(ids)
         self.documents.extend(documents)
         self.metadatas.extend(metadatas)
 
+    def delete(self, *, ids):
+        kept = [(item_id, doc, meta) for item_id, doc, meta in
+                zip(self.ids, self.documents, self.metadatas) if item_id not in ids]
+        self.ids = [item[0] for item in kept]
+        self.documents = [item[1] for item in kept]
+        self.metadatas = [item[2] for item in kept]
+
     def count(self):
         return len(self.documents)
 
-    def get(self, *, limit, include):
-        return {"metadatas": self.metadatas[:limit]}
+    def get(self, *, where=None, limit=None, offset=0, include=None):
+        selected = [(item_id, doc, meta) for item_id, doc, meta in
+                    zip(self.ids, self.documents, self.metadatas)
+                    if not where or all(meta.get(key) == value for key, value in where.items())]
+        selected = selected[offset:offset + limit if limit is not None else None]
+        return {"ids": [item[0] for item in selected],
+                "documents": [item[1] for item in selected],
+                "metadatas": [item[2] for item in selected]}
+
+    def query(self, *, query_texts, n_results):
+        matches = [(item_id, doc, meta) for item_id, doc, meta in
+                   zip(self.ids, self.documents, self.metadatas)
+                   if query_texts[0] in doc][:n_results]
+        return {"ids": [[item[0] for item in matches]],
+                "documents": [[item[1] for item in matches]],
+                "metadatas": [[item[2] for item in matches]],
+                "distances": [[0.1 for _ in matches]]}
 
 
 class _ExistingCollection:
+    metadata = {"seeded": "true"}
+
     def count(self):
         return 1
 
@@ -108,10 +134,64 @@ def test_chunk_metadata_keeps_title_index_and_total():
     assert added > 1
     assert len(kb._collection.documents) == added
     assert all(len(chunk) <= 500 for chunk in kb._collection.documents)
-    assert kb._collection.metadatas == [
-        {"title": "打印机排查", "chunk_index": index, "total_chunks": added}
-        for index in range(added)
-    ]
+    assert [meta["chunk_index"] for meta in kb._collection.metadatas] == list(range(added))
+    assert all(meta["title"] == "打印机排查" and meta["total_chunks"] == added
+               and meta["document_id"] == KnowledgeBase.document_id("打印机排查")
+               for meta in kb._collection.metadatas)
+
+
+def test_document_lifecycle_keeps_only_latest_version_and_delete_removes_search_results():
+    kb = object.__new__(KnowledgeBase)
+    kb._collection = _CaptureCollection()
+    title = "VPN 排查"
+    original = "账号错误。\n请确认登录域。" * 30
+    revised = "新版处理流程：先确认账号状态。" * 30
+
+    first = kb.upsert_document(title, original)
+    assert first["status"] == "created"
+    assert kb.get_document(first["document_id"])["content"] == original
+    assert kb.upsert_document(title, original)["status"] == "unchanged"
+    assert kb._collection.count() == first["chunk_count"]
+
+    updated = kb.upsert_document(title, revised)
+    assert updated["status"] == "updated"
+    assert kb._collection.count() == updated["chunk_count"]
+    assert kb.get_document(first["document_id"])["content"] == revised
+    assert not kb.search("请确认登录域")
+    assert kb.search("新版处理流程")
+    assert kb.delete_document(first["document_id"]) is True
+    assert not kb.search("新版处理流程")
+    assert kb.list_documents() == []
+    assert kb.delete_document(first["document_id"]) is False
+
+
+def test_legacy_title_chunks_can_be_replaced():
+    kb = object.__new__(KnowledgeBase)
+    kb._collection = _CaptureCollection()
+    kb._collection.add(ids=["old-id"], documents=["旧内容"],
+                       metadatas=[{"title": "VPN 排查", "chunk_index": 0}])
+    result = kb.upsert_document("VPN 排查", "新内容")
+    assert result["status"] == "updated"
+    assert kb._collection.ids == [f'{result["document_id"]}:{result["version"]}:0']
+
+
+def test_default_documents_are_not_reseeded_after_all_documents_are_deleted(monkeypatch):
+    collection = _CaptureCollection()
+    collection.metadata = {}
+
+    def modify(*, metadata):
+        collection.metadata = metadata
+
+    collection.modify = modify
+    client = _CaptureChromaClient()
+    client.get_or_create_collection = lambda **kwargs: collection
+    monkeypatch.setattr("mcp.knowledge_base.chromadb.Settings", lambda **kwargs: object())
+    monkeypatch.setattr("mcp.knowledge_base.chromadb.HttpClient", lambda **kwargs: client)
+    kb = KnowledgeBase()
+    assert len(kb.list_documents()) == 8
+    for item in kb.list_documents():
+        kb.delete_document(item["document_id"])
+    assert KnowledgeBase().list_documents() == []
 
 
 def test_stats_proves_active_collection_and_actual_document_titles():

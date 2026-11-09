@@ -82,14 +82,16 @@ Redis、ChromaDB 和 Prometheus 的宿主机端口仅绑定 `127.0.0.1`，分别
 | `POST /chat` | IT 问答与多 Agent 编排（用户令牌） |
 | `POST /conversation/archive` | 归档当前会话 |
 | `POST /search` | 独立验证查询改写、并行召回与重排链路 |
-| `POST /knowledge/add`、`POST /knowledge/upload` | 导入文本或文件（管理员令牌） |
+| `POST /knowledge/add`、`POST /knowledge/upload` | 按标题导入或更新文本、文件（管理员令牌） |
+| `GET /knowledge/documents`、`GET /knowledge/documents/{document_id}` | 列出文档、读取正文（管理员令牌） |
+| `PUT /knowledge/documents/{document_id}`、`DELETE /knowledge/documents/{document_id}` | 更新正文、删除文档及其片段（管理员令牌） |
 | `GET /knowledge/stats` | 知识库集合与文档统计 |
 | `GET /skills`、`POST /skills/reload` | 查看或重载业务规范 |
 | `GET /trace/tool/{request_id}` | 查询单次请求的工具轨迹 |
 | `GET /monitor`、`GET /metrics` | 运行摘要与 Prometheus 指标入口 |
 | `POST /eval/run` | 运行意图及对话质量评测（管理员令牌）；调用模型可能产生费用 |
 
-知识库上传支持 `.txt`、`.md` 和包含 `title`、`content` 的 JSON 文档数组；单个上传文件限制为 10 MB。运行中的知识库默认会导入 IT 服务示例文档，已有数据保存在 ChromaDB 中，不会因重建应用容器自动清空。
+知识库上传支持 `.txt`、`.md` 和包含 `title`、`content` 的 JSON 文档数组；单个上传文件限制为 10 MB。同一标题视为同一文档：重复导入返回 `unchanged` 且 `added_chunks=0`；内容变化时返回 `updated` 并移除旧片段。编辑时标题不可更改，删除后文档不再参与检索。首次初始化会导入 IT 服务示例文档；初始化标记保存在 ChromaDB，删除全部文档后重启不会重新导入。已有数据不会因重建应用容器自动清空。
 
 ## 代码结构
 

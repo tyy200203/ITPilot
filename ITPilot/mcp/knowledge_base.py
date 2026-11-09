@@ -78,42 +78,114 @@ class KnowledgeBase:
             },
         )
 
-        # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
-            self._load_default_docs()
+        # 仅首次初始化时导入示例。删除最后一篇后重启也不应再次出现。
+        if (self._collection.metadata or {}).get("seeded") != "true":
+            if self._collection.count() == 0:
+                self._load_default_docs()
+            self._collection.modify(metadata={**(self._collection.metadata or {}), "seeded": "true"})
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def document_id(title: str) -> str:
+        """A title identifies one managed document, including legacy chunks."""
+        return hashlib.sha256(title.strip().encode("utf-8")).hexdigest()
+
+    def upsert_document(self, title: str, content: str) -> Dict[str, Any]:
+        title = title.strip()
+        content = content.strip()
+        if not title or not content:
+            raise ValueError("文档标题和内容不能为空")
+        chunks = self._chunk_text(content, chunk_size=500)
+        previous = self._collection.get(where={"title": title}, include=["documents", "metadatas"])
+        old_ids = previous.get("ids") or []
+        old_chunks = [item for _, item in sorted(zip(
+            [meta.get("chunk_index", 0) for meta in previous.get("metadatas") or []],
+            previous.get("documents") or [],
+        ))]
+        doc_id = self.document_id(title)
+        version = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if old_ids and old_chunks == chunks:
+            return {"document_id": doc_id, "title": title, "version": version,
+                    "status": "unchanged", "added_chunks": 0, "chunk_count": len(chunks)}
+
+        ids = [f"{doc_id}:{version}:{index}" for index in range(len(chunks))]
+        metadata = [{"document_id": doc_id, "title": title, "version": version,
+                     "chunk_index": index, "total_chunks": len(chunks)}
+                    for index in range(len(chunks))]
+        self._collection.add(ids=ids, documents=chunks, metadatas=metadata)
+        if old_ids:
+            self._collection.delete(ids=old_ids)
+        status = "updated" if old_ids else "created"
+        logger.info("知识库文档 %s: %s (%d chunks)", status, title, len(chunks))
+        return {"document_id": doc_id, "title": title, "version": version,
+                "status": status, "added_chunks": len(chunks), "chunk_count": len(chunks)}
+
+    def upsert_documents(self, documents: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        if any(not isinstance(doc, dict) or not isinstance(doc.get("title"), str)
+               or not isinstance(doc.get("content"), str) or not doc["title"].strip()
+               or not doc["content"].strip() for doc in documents):
+            raise ValueError("每篇文档都必须提供非空标题和内容")
+        return [self.upsert_document(doc.get("title", ""), doc.get("content", "")) for doc in documents]
+
+    async def upsert_documents_async(self, documents: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.upsert_documents, documents)
+
     def add_documents(self, documents: List[Dict[str, str]]) -> int:
-        """
-        批量导入文档到知识库。
-
-        documents 格式: [{"title": "...", "content": "..."}, ...]
-        长文档会自动切片（每片 500 字）。
-        """
-        ids, docs, metas = [], [], []
-
-        for doc in documents:
-            title   = doc.get("title", "")
-            content = doc.get("content", "")
-            chunks  = self._chunk_text(content, chunk_size=500)
-
-            for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
-                ids.append(doc_id)
-                docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
-
-        if ids:
-            # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
-            logger.info(f"知识库导入 {len(ids)} 个文档片段")
-
-        return len(ids)
+        """Compatibility wrapper; returns only chunks actually written."""
+        return sum(item["added_chunks"] for item in self.upsert_documents(documents))
 
     async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
         return await asyncio.to_thread(self.add_documents, documents)
+
+    def list_documents(self) -> List[Dict[str, Any]]:
+        titles: Dict[str, Dict[str, Any]] = {}
+        offset = 0
+        while True:
+            page = self._collection.get(limit=500, offset=offset, include=["metadatas"])
+            ids = page.get("ids") or []
+            for meta in page.get("metadatas") or []:
+                title = meta.get("title", "")
+                if not title:
+                    continue
+                item = titles.setdefault(title, {"document_id": self.document_id(title),
+                                                  "title": title, "status": "active",
+                                                  "version": meta.get("version", "legacy"),
+                                                  "chunk_count": 0})
+                item["chunk_count"] += 1
+            offset += len(ids)
+            if len(ids) < 500:
+                break
+        return sorted(titles.values(), key=lambda item: item["title"])
+
+    async def list_documents_async(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.list_documents)
+
+    def get_document(self, document_id: str) -> Optional[Dict[str, Any]]:
+        item = next((item for item in self.list_documents() if item["document_id"] == document_id), None)
+        if item is None:
+            return None
+        result = self._collection.get(where={"title": item["title"]}, include=["documents", "metadatas"])
+        parts = sorted(zip(result.get("metadatas") or [], result.get("documents") or []),
+                       key=lambda pair: pair[0].get("chunk_index", 0))
+        separator = "\n" if item["version"] == "legacy" else ""
+        return {**item, "content": separator.join(text for _, text in parts)}
+
+    async def get_document_async(self, document_id: str) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self.get_document, document_id)
+
+    def delete_document(self, document_id: str) -> bool:
+        item = next((item for item in self.list_documents() if item["document_id"] == document_id), None)
+        if item is None:
+            return False
+        ids = self._collection.get(where={"title": item["title"]}, include=[]).get("ids") or []
+        if ids:
+            self._collection.delete(ids=ids)
+        return True
+
+    async def delete_document_async(self, document_id: str) -> bool:
+        return await asyncio.to_thread(self.delete_document, document_id)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -159,20 +231,12 @@ class KnowledgeBase:
     def stats(self) -> Dict[str, Any]:
         """返回当前实际 collection 及其中的文档标题，便于核验部署版本。"""
         total_chunks = self._collection.count()
-        titles = set()
-        if total_chunks:
-            result = self._collection.get(
-                limit=min(total_chunks, 1000),
-                include=["metadatas"],
-            )
-            for metadata in result.get("metadatas") or []:
-                if isinstance(metadata, dict) and metadata.get("title"):
-                    titles.add(str(metadata["title"]))
+        titles = [item["title"] for item in self.list_documents()]
         return {
             "collection_name": self.collection_name,
             "corpus_id": self.DEFAULT_CORPUS_ID,
             "total_chunks": total_chunks,
-            "document_titles": sorted(titles),
+            "document_titles": titles,
         }
 
     async def stats_async(self) -> Dict[str, Any]:
@@ -198,28 +262,19 @@ class KnowledgeBase:
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
-        if len(text) <= chunk_size:
-            return [text] if text.strip() else []
-
+        """在句末附近切片，同时保留原文以便编辑时准确还原。"""
         chunks = []
-        current = ""
-        # 按句子切分
-        sentences = text.replace("\n", "。").split("。")
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-            if len(current) + len(sent) + 1 > chunk_size:
-                if current:
-                    chunks.append(current)
-                current = sent
+        remaining = text
+        while remaining:
+            if len(remaining) <= chunk_size:
+                cut = len(remaining)
             else:
-                current = f"{current}。{sent}" if current else sent
-
-        if current:
-            chunks.append(current)
-
+                cut = max(remaining.rfind(mark, chunk_size // 2, chunk_size) + 1
+                          for mark in "。！？.!?\n")
+                if cut == 0:
+                    cut = chunk_size
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:]
         return chunks
 
     def _load_default_docs(self) -> None:

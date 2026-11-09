@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections import deque
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -34,6 +35,12 @@ class ApiClient:
     def post(self, path, **kwargs):
         return self.request("POST", path, **kwargs)
 
+    def put(self, path, **kwargs):
+        return self.request("PUT", path, **kwargs)
+
+    def delete(self, path, **kwargs):
+        return self.request("DELETE", path, **kwargs)
+
 
 @pytest.fixture
 def client(monkeypatch):
@@ -66,6 +73,10 @@ def test_auth_configuration_fails_closed(monkeypatch):
     ("/skills/reload", "post", {}),
     ("/knowledge/add", "post", {"json": {"documents": []}}),
     ("/knowledge/upload", "post", {"files": {"file": ("note.txt", b"hello")}}),
+    ("/knowledge/documents", "get", {}),
+    ("/knowledge/documents/doc-id", "get", {}),
+    ("/knowledge/documents/doc-id", "put", {"json": {"title": "VPN", "content": "新内容"}}),
+    ("/knowledge/documents/doc-id", "delete", {}),
     ("/eval/run", "post", {}),
     ("/trace/tools", "get", {}),
     ("/monitor", "get", {}),
@@ -80,6 +91,46 @@ def test_admin_token_passes_boundary(client):
     # Service globals are intentionally uninitialized; 503 means auth passed.
     assert client.post("/skills/reload", headers=bearer(ADMIN_TOKEN)).status_code == 503
     assert client.post("/eval/run", headers=bearer(ADMIN_TOKEN)).status_code == 503
+
+
+def test_admin_can_list_update_and_delete_knowledge_documents(client, monkeypatch):
+    class Knowledge:
+        def __init__(self):
+            self.content = "旧内容"
+
+        async def search_handler(self, params, context):
+            return []
+
+        async def list_documents_async(self):
+            return [{"document_id": "doc-1", "title": "VPN", "chunk_count": 1}]
+
+        async def get_document_async(self, document_id):
+            if document_id != "doc-1":
+                return None
+            return {"document_id": document_id, "title": "VPN", "content": self.content}
+
+        def upsert_document(self, title, content):
+            self.content = content
+            return {"document_id": "doc-1", "title": title, "status": "updated"}
+
+        async def delete_document_async(self, document_id):
+            return document_id == "doc-1"
+
+    knowledge = Knowledge()
+    monkeypatch.setattr(main, "_tool_manager", SimpleNamespace(_tools={
+        "knowledge_search": SimpleNamespace(handler=knowledge.search_handler)
+    }))
+    headers = bearer(ADMIN_TOKEN)
+    assert client.get("/knowledge/documents", headers=headers).json()["documents"][0]["title"] == "VPN"
+    assert client.get("/knowledge/documents/doc-1", headers=headers).json()["content"] == "旧内容"
+    assert client.put("/knowledge/documents/doc-1", headers=headers,
+                      json={"title": "其他", "content": "新版"}).status_code == 400
+    result = client.put("/knowledge/documents/doc-1", headers=headers,
+                        json={"title": "VPN", "content": "新版"})
+    assert result.status_code == 200 and result.json()["status"] == "updated"
+    assert client.get("/knowledge/documents/doc-1", headers=headers).json()["content"] == "新版"
+    assert client.delete("/knowledge/documents/doc-1", headers=headers).json()["deleted"] is True
+    assert client.delete("/knowledge/documents/missing", headers=headers).status_code == 404
 
 
 def test_chat_identity_is_bound_to_token(client):

@@ -497,9 +497,14 @@ async def add_knowledge(body: BatchDocInput, _: Principal = Depends(require_admi
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
+    try:
+        documents = await kb.upsert_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    count = sum(item["added_chunks"] for item in documents)
     total = await kb.doc_count_async()
-    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
+    return {"message": f"写入 {count} 个文档片段", "documents": documents,
+            "added_chunks": count, "total_chunks": total}
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
@@ -538,13 +543,60 @@ async def upload_knowledge(file: UploadFile = File(...), _: Principal = Depends(
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    count = await kb.add_documents_async(docs)
+    try:
+        documents = await kb.upsert_documents_async(docs)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    count = sum(item["added_chunks"] for item in documents)
     total = await kb.doc_count_async()
     return {
         "message": f"文件 {filename} 导入成功",
+        "documents": documents,
         "added_chunks": count,
         "total_chunks": total,
     }
+
+
+def _knowledge_base():
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    return tool.handler.__self__
+
+
+@app.get("/knowledge/documents", tags=["知识库"])
+async def list_knowledge_documents(_: Principal = Depends(require_admin)):
+    return {"documents": await _knowledge_base().list_documents_async()}
+
+
+@app.get("/knowledge/documents/{document_id}", tags=["知识库"])
+async def get_knowledge_document(document_id: str, _: Principal = Depends(require_admin)):
+    document = await _knowledge_base().get_document_async(document_id)
+    if document is None:
+        raise HTTPException(404, "文档不存在")
+    return document
+
+
+@app.put("/knowledge/documents/{document_id}", tags=["知识库"])
+async def update_knowledge_document(document_id: str, body: DocInput,
+                                    _: Principal = Depends(require_admin)):
+    kb = _knowledge_base()
+    existing = await kb.get_document_async(document_id)
+    if existing is None:
+        raise HTTPException(404, "文档不存在")
+    if body.title.strip() != existing["title"]:
+        raise HTTPException(400, "更新文档时不能修改标题")
+    try:
+        return await asyncio.to_thread(kb.upsert_document, body.title, body.content)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/knowledge/documents/{document_id}", tags=["知识库"])
+async def delete_knowledge_document(document_id: str, _: Principal = Depends(require_admin)):
+    if not await _knowledge_base().delete_document_async(document_id):
+        raise HTTPException(404, "文档不存在")
+    return {"deleted": True, "document_id": document_id}
 
 
 @app.get("/knowledge/stats", tags=["知识库"])
