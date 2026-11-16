@@ -194,6 +194,29 @@ async def _evaluate_baseline(collection: Any, cases: Sequence[Dict[str, Any]], t
     return {"metrics": metrics, "cases": details}
 
 
+async def _evaluate_hybrid(collection: Any, cases: Sequence[Dict[str, Any]], top_k: int) -> Dict[str, Any]:
+    """用生产 KnowledgeBase.search 比较同库、同 query、同 top_k 的混合召回。"""
+    from mcp.knowledge_base import KnowledgeBase
+
+    kb = object.__new__(KnowledgeBase)
+    kb._collection = collection
+    details: List[Dict[str, Any]] = []
+    latencies: List[float] = []
+    for index, case in enumerate(cases, start=1):
+        started = time.perf_counter()
+        rows = await kb.search_async(case["query"], top_k)
+        latency_ms = (time.perf_counter() - started) * 1000
+        latencies.append(latency_ms)
+        details.append({**case, "retrieved_chunk_ids": [row["chunk_id"] for row in rows],
+                        "retrieved": rows, "latency_ms": round(latency_ms, 2)})
+        if index % 10 == 0:
+            print(f"hybrid progress: {index}/{len(cases)}", flush=True)
+    metrics = retrieval_metrics(details, top_k)
+    metrics["avg_latency_ms"] = round(statistics.mean(latencies), 2)
+    metrics["p95_latency_ms"] = round(sorted(latencies)[max(0, int(len(latencies) * 0.95) - 1)], 2)
+    return {"metrics": metrics, "cases": details}
+
+
 async def _evaluate_optimized(
     collection: Any,
     cases: Sequence[Dict[str, Any]],
@@ -231,13 +254,13 @@ async def _evaluate_optimized(
             message = "模型接口返回403：免费额度已耗尽，请充值或关闭仅使用免费额度模式"
         raise RuntimeError(f"优化链路模型预检失败：{message[:500]}") from ex
 
+    from mcp.knowledge_base import KnowledgeBase
+    kb = object.__new__(KnowledgeBase)
+    kb._collection = collection
+
     async def handler(params: Dict[str, Any], context: Any) -> List[Dict[str, Any]]:
-        return await asyncio.to_thread(
-            _query_collection,
-            collection,
-            str(params.get("query", "")),
-            int(params.get("top_k", top_k)),
-        )
+        return await kb.search_async(str(params.get("query", "")),
+                                     int(params.get("top_k", top_k)))
 
     manager.register(Tool(
         name="knowledge_search",
@@ -315,10 +338,15 @@ def _summary_markdown(report: Dict[str, Any], top_k: int) -> str:
         "| --- | ---: | ---: | ---: | ---: | ---: |",
         f"| 基础向量检索 | {baseline[f'recall_at_{top_k}']:.2%} | {baseline[f'mrr_at_{top_k}']:.2%} | {baseline[f'hit_at_{top_k}']:.2%} | {baseline['avg_latency_ms']:.2f}ms | {baseline['p95_latency_ms']:.2f}ms |",
     ]
+    if "hybrid" in report:
+        hybrid = report["hybrid"]["metrics"]
+        lines.append(
+            f"| 向量+BM25混合检索 | {hybrid[f'recall_at_{top_k}']:.2%} | {hybrid[f'mrr_at_{top_k}']:.2%} | {hybrid[f'hit_at_{top_k}']:.2%} | {hybrid['avg_latency_ms']:.2f}ms | {hybrid['p95_latency_ms']:.2f}ms |"
+        )
     if "optimized" in report:
         optimized = report["optimized"]["metrics"]
         lines.append(
-            f"| 改写+并行召回+重排 | {optimized[f'recall_at_{top_k}']:.2%} | {optimized[f'mrr_at_{top_k}']:.2%} | {optimized[f'hit_at_{top_k}']:.2%} | {optimized['avg_latency_ms']:.2f}ms | {optimized['p95_latency_ms']:.2f}ms |"
+            f"| 混合检索+改写+重排 | {optimized[f'recall_at_{top_k}']:.2%} | {optimized[f'mrr_at_{top_k}']:.2%} | {optimized[f'hit_at_{top_k}']:.2%} | {optimized['avg_latency_ms']:.2f}ms | {optimized['p95_latency_ms']:.2f}ms |"
         )
         lines.extend([
             "",
@@ -335,6 +363,9 @@ def _summary_markdown(report: Dict[str, Any], top_k: int) -> str:
             f"- 优化链路状态：**未完成**（{blocked['reason']}）",
             "- 说明：未把查询改写失败后的原查询降级结果冒充为优化检索成绩。",
         ])
+    if "hybrid" in report:
+        hybrid = report["hybrid"]["metrics"]
+        lines.extend(["", f"- 混合检索 Recall@{top_k} 变化：{(hybrid[f'recall_at_{top_k}'] - baseline[f'recall_at_{top_k}']) * 100:+.2f}个百分点"])
     lines.extend([
         "",
         "## 口径",
@@ -353,6 +384,7 @@ async def run(args: argparse.Namespace) -> Dict[str, Any]:
     collection, backend_used = _connect_collection(args, chunks)
     top_k = int(metadata.get("top_k", args.top_k) or args.top_k)
     baseline = await _evaluate_baseline(collection, cases, top_k)
+    hybrid = await _evaluate_hybrid(collection, cases, top_k)
     report: Dict[str, Any] = {
         "suite_id": metadata["suite_id"],
         "timestamp": datetime.now().isoformat(),
@@ -364,6 +396,7 @@ async def run(args: argparse.Namespace) -> Dict[str, Any]:
         "case_count": len(cases),
         "top_k": top_k,
         "baseline": baseline,
+        "hybrid": hybrid,
     }
     if args.mode == "both":
         try:

@@ -215,13 +215,16 @@ def test_knowledge_search_returns_chroma_chunk_id():
     class _QueryCollection:
         def query(self, *, query_texts, n_results):
             assert query_texts == ["VPN 691"]
-            assert n_results == 5
+            assert n_results == 10
             return {
                 "ids": [["vpn-chunk-1"]],
                 "documents": [["检查账号状态"]],
                 "metadatas": [[{"title": "VPN 排查", "chunk_index": 0}]],
                 "distances": [[0.2]],
             }
+
+        def get(self, *, limit, offset, include):
+            return {"ids": [], "documents": [], "metadatas": []}
 
     kb = object.__new__(KnowledgeBase)
     kb._collection = _QueryCollection()
@@ -230,9 +233,46 @@ def test_knowledge_search_returns_chroma_chunk_id():
         "chunk_id": "vpn-chunk-1",
         "title": "VPN 排查",
         "content": "检查账号状态",
-        "score": 0.8,
+        "score": 0.5,
         "chunk": 0,
+        "vector_score": 0.8,
+        "retrieval_sources": ["vector"],
     }]
+
+
+def test_hybrid_search_recovers_exact_error_code_missed_by_vector():
+    class _VectorMissCollection(_CaptureCollection):
+        def query(self, *, query_texts, n_results):
+            return {"ids": [["z-semantic"]], "documents": [["网络连接异常"]],
+                    "metadatas": [[{"title": "网络排查", "chunk_index": 0}]],
+                    "distances": [[0.1]]}
+
+    kb = object.__new__(KnowledgeBase)
+    kb._collection = _VectorMissCollection()
+    kb._collection.add(ids=["z-semantic", "a-exact"],
+                       documents=["网络连接异常", "VPN 错误 691：检查用户名和登录域"],
+                       metadatas=[{"title": "网络排查", "chunk_index": 0},
+                                  {"title": "VPN 排查", "chunk_index": 0}])
+
+    results = kb.search("VPN 691", top_k=2)
+
+    assert [item["chunk_id"] for item in results] == ["a-exact", "z-semantic"]
+    assert results[0]["retrieval_sources"] == ["keyword"]
+    assert KnowledgeBase._terms("打印机脱机 VPN 691") == ["打印", "印机", "机脱", "脱机", "vpn", "691"]
+
+
+def test_hybrid_search_merges_same_chunk_from_both_channels():
+    kb = object.__new__(KnowledgeBase)
+    kb._collection = _CaptureCollection()
+    kb._collection.add(ids=["vpn-691"], documents=["VPN 691 错误：检查账号"],
+                       metadatas=[{"title": "VPN 排查", "chunk_index": 0}])
+
+    rows = kb.search("VPN 691", top_k=5)
+
+    assert len(rows) == 1
+    assert rows[0]["chunk_id"] == "vpn-691"
+    assert rows[0]["retrieval_sources"] == ["vector", "keyword"]
+    assert rows[0]["score"] == 1.0
 
 
 def test_rewrite_search_deduplicates_by_chunk_id_even_when_scores_differ():

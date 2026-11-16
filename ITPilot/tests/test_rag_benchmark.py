@@ -85,4 +85,4 @@ def test_summary_does_not_present_blocked_optimized_run_as_a_metric():
 
     assert "优化链路状态：**未完成**" in summary
     assert "模型额度不足" in summary
-    assert "| 改写+并行召回+重排 |" not in summary
+    assert "| 混合检索+改写+重排 |" not in summary

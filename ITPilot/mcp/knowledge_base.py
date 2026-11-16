@@ -3,7 +3,7 @@ RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
 
 功能：
   1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
-  2. 语义检索：根据 query 从知识库中检索最相关的文档片段
+  2. 混合检索：向量召回 + BM25 关键词召回，并用 RRF 合并排名
   3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
 
 ChromaDB 在这里的角色：
@@ -14,7 +14,12 @@ ChromaDB 在这里的角色：
 import asyncio
 import hashlib
 import logging
+import math
 import os
+import re
+import threading
+import time
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -28,6 +33,7 @@ class KnowledgeBase:
 
     ChromaDB 内置了 Embedding 模型（all-MiniLM-L6-v2），
     调用 add() 时自动生成向量，query() 时自动做语义匹配。
+    关键词索引在本进程缓存 30 秒；文档写入和删除时立即失效。
     不需要额外调用 Anthropic Embeddings API。
     """
 
@@ -36,6 +42,8 @@ class KnowledgeBase:
     DEFAULT_COLLECTION_NAME = "itpilot_knowledge_base_v1"
     COLLECTION_NAME = DEFAULT_COLLECTION_NAME
     DEFAULT_CORPUS_ID = "itpilot-it-service-v1"
+    KEYWORD_CACHE_TTL_S = 30
+    RRF_K = 60
 
     def __init__(
         self,
@@ -77,6 +85,8 @@ class KnowledgeBase:
                 "schema_version": "1",
             },
         )
+        self._keyword_lock = threading.RLock()
+        self._keyword_cache = None
 
         # 仅首次初始化时导入示例。删除最后一篇后重启也不应再次出现。
         if (self._collection.metadata or {}).get("seeded") != "true":
@@ -116,6 +126,7 @@ class KnowledgeBase:
         self._collection.add(ids=ids, documents=chunks, metadatas=metadata)
         if old_ids:
             self._collection.delete(ids=old_ids)
+        self._keyword_cache = None
         status = "updated" if old_ids else "created"
         logger.info("知识库文档 %s: %s (%d chunks)", status, title, len(chunks))
         return {"document_id": doc_id, "title": title, "version": version,
@@ -182,39 +193,116 @@ class KnowledgeBase:
         ids = self._collection.get(where={"title": item["title"]}, include=[]).get("ids") or []
         if ids:
             self._collection.delete(ids=ids)
+            self._keyword_cache = None
         return True
 
     async def delete_document_async(self, document_id: str) -> bool:
         return await asyncio.to_thread(self.delete_document, document_id)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        语义检索：根据 query 返回最相关的文档片段。
-
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
-        """
+        """向量和 BM25 分别召回，再按 RRF 排名合并片段 ID。"""
+        if not query.strip() or top_k <= 0:
+            return []
+        candidate_count = max(10, top_k * 2)
         results = self._collection.query(
             query_texts=[query],
-            n_results=top_k,
+            n_results=candidate_count,
         )
 
-        items = []
-        if results["documents"] and results["documents"][0]:
+        vector_rows = [
+            {"chunk_id": str(chunk_id), "title": (meta or {}).get("title", ""),
+             "content": doc, "chunk": (meta or {}).get("chunk_index", 0),
+             "vector_score": round(1.0 - float(dist), 4)}
             for chunk_id, doc, meta, dist in zip(
-                results["ids"][0],
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-            ):
-                items.append({
-                    "chunk_id": str(chunk_id),
-                    "title":    meta.get("title", ""),
-                    "content":  doc,
-                    "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
-                    "chunk":    meta.get("chunk_index", 0),
-                })
+                (results.get("ids") or [[]])[0],
+                (results.get("documents") or [[]])[0],
+                (results.get("metadatas") or [[]])[0],
+                (results.get("distances") or [[]])[0],
+            )
+        ]
+        keyword_rows = self._keyword_search(query, candidate_count)
+        combined: Dict[str, Dict[str, Any]] = {}
+        for source, rows in (("vector", vector_rows), ("keyword", keyword_rows)):
+            for rank, row in enumerate(rows, start=1):
+                chunk_id = row["chunk_id"]
+                entry = combined.setdefault(chunk_id, {**row, "_rrf": 0.0, "retrieval_sources": []})
+                entry["_rrf"] += 1.0 / (self.RRF_K + rank)
+                entry["retrieval_sources"].append(source)
+                if source == "vector":
+                    entry["vector_score"] = row["vector_score"]
+        ranked = sorted(combined.values(), key=lambda row: (-row["_rrf"], row["chunk_id"]))
+        for row in ranked:
+            row["score"] = round(row.pop("_rrf") * (self.RRF_K + 1) / 2, 4)
+        return ranked[:top_k]
 
-        return items
+    @staticmethod
+    def _terms(text: str) -> List[str]:
+        """保留英文/数字词，中文使用二元字片段，兼容没有空格的 IT 问句。"""
+        terms = []
+        for match in re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", text.lower()):
+            if "\u4e00" <= match[0] <= "\u9fff":
+                terms.extend(match[index:index + 2] for index in range(len(match) - 1))
+                if len(match) == 1:
+                    terms.append(match)
+            else:
+                terms.append(match)
+        return terms
+
+    def _keyword_index(self) -> Dict[str, Any]:
+        lock = getattr(self, "_keyword_lock", None)
+        if lock is None:  # 兼容无需连接 ChromaDB 的单元测试实例
+            lock = self._keyword_lock = threading.RLock()
+        with lock:
+            cached = getattr(self, "_keyword_cache", None)
+            if cached and time.monotonic() - cached["built_at"] < self.KEYWORD_CACHE_TTL_S:
+                return cached
+            rows = []
+            df = Counter()
+            offset = 0
+            while True:
+                page = self._collection.get(limit=500, offset=offset,
+                                            include=["documents", "metadatas"])
+                ids = page.get("ids") or []
+                for chunk_id, doc, meta in zip(ids, page.get("documents") or [],
+                                               page.get("metadatas") or []):
+                    meta = meta or {}
+                    term_counts = Counter(self._terms(f'{meta.get("title", "")} {doc}'))
+                    df.update(term_counts.keys())
+                    rows.append({"chunk_id": str(chunk_id), "title": meta.get("title", ""),
+                                 "content": doc, "chunk": meta.get("chunk_index", 0),
+                                 "terms": term_counts, "length": sum(term_counts.values())})
+                offset += len(ids)
+                if len(ids) < 500:
+                    break
+            cached = {"built_at": time.monotonic(), "rows": rows, "df": df,
+                      "avg_length": sum(row["length"] for row in rows) / len(rows) if rows else 0}
+            self._keyword_cache = cached
+            return cached
+
+    def _keyword_search(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        index = self._keyword_index()
+        rows = index["rows"]
+        if not rows:
+            return []
+        terms = set(self._terms(query))
+        scored = []
+        for row in rows:
+            score = 0.0
+            matched_terms = terms.intersection(row["terms"])
+            if len(terms) > 1 and len(matched_terms) < 2 and not any(term.isdigit() for term in matched_terms):
+                continue
+            for term in matched_terms:
+                frequency = row["terms"].get(term, 0)
+                if frequency:
+                    idf = math.log1p((len(rows) - index["df"][term] + 0.5)
+                                     / (index["df"][term] + 0.5))
+                    normalizer = frequency + 1.2 * (0.25 + 0.75 * row["length"] / index["avg_length"])
+                    score += idf * frequency * 2.2 / normalizer
+            if score > 0:
+                scored.append((score, row))
+        scored.sort(key=lambda pair: (-pair[0], pair[1]["chunk_id"]))
+        return [{key: value for key, value in row.items() if key not in ("terms", "length")}
+                for _, row in scored[:limit]]
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
