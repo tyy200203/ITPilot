@@ -1,0 +1,19 @@
+services:
+  supportweave-frontend:
+    image: supportweave-frontend:3.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: supportweave-frontend
+    ports:
+      - "5174:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - supportweave-frontend-network
+    restart: unless-stopped
+
+networks:
+  supportweave-frontend-network:
+    name: supportweave-frontend-network
+    driver: bridge

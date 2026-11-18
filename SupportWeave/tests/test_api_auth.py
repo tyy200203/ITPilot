@@ -1,0 +1,192 @@
+import asyncio
+import json
+from collections import deque
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from api import main
+from api.auth import get_auth_config
+from agents.agent_orchestrator import AgentOrchestrator, AgentType, OrchestratorResult
+
+
+USER_1_TOKEN = "user-one-secret-token-0123456789"
+USER_2_TOKEN = "user-two-secret-token-0123456789"
+ADMIN_TOKEN = "admin-secret-token-012345678901"
+
+
+def bearer(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+class ApiClient:
+    def request(self, method, path, **kwargs):
+        async def send():
+            transport = httpx.ASGITransport(app=main.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.request(method, path, **kwargs)
+
+        return asyncio.run(send())
+
+    def get(self, path, **kwargs):
+        return self.request("GET", path, **kwargs)
+
+    def post(self, path, **kwargs):
+        return self.request("POST", path, **kwargs)
+
+    def put(self, path, **kwargs):
+        return self.request("PUT", path, **kwargs)
+
+    def delete(self, path, **kwargs):
+        return self.request("DELETE", path, **kwargs)
+
+
+@pytest.fixture
+def client(monkeypatch):
+    monkeypatch.setenv("SUPPORTWEAVE_USER_TOKENS", json.dumps({
+        "u1": USER_1_TOKEN,
+        "u2": USER_2_TOKEN,
+    }))
+    monkeypatch.setenv("SUPPORTWEAVE_ADMIN_TOKEN", ADMIN_TOKEN)
+    get_auth_config.cache_clear()
+    yield ApiClient()  # No lifespan: auth checks run before service components.
+    get_auth_config.cache_clear()
+
+
+def test_auth_configuration_fails_closed(monkeypatch):
+    monkeypatch.delenv("SUPPORTWEAVE_USER_TOKENS", raising=False)
+    monkeypatch.delenv("SUPPORTWEAVE_ADMIN_TOKEN", raising=False)
+    get_auth_config.cache_clear()
+    with pytest.raises(RuntimeError):
+        get_auth_config()
+
+    monkeypatch.setenv("SUPPORTWEAVE_USER_TOKENS", json.dumps({"u1": USER_1_TOKEN}))
+    monkeypatch.setenv("SUPPORTWEAVE_ADMIN_TOKEN", USER_1_TOKEN)
+    get_auth_config.cache_clear()
+    with pytest.raises(RuntimeError, match="distinct"):
+        get_auth_config()
+    get_auth_config.cache_clear()
+
+
+@pytest.mark.parametrize("path,method,kwargs", [
+    ("/skills/reload", "post", {}),
+    ("/knowledge/add", "post", {"json": {"documents": []}}),
+    ("/knowledge/upload", "post", {"files": {"file": ("note.txt", b"hello")}}),
+    ("/knowledge/documents", "get", {}),
+    ("/knowledge/documents/doc-id", "get", {}),
+    ("/knowledge/documents/doc-id", "put", {"json": {"title": "VPN", "content": "新内容"}}),
+    ("/knowledge/documents/doc-id", "delete", {}),
+    ("/eval/run", "post", {}),
+    ("/trace/tools", "get", {}),
+    ("/monitor", "get", {}),
+])
+def test_admin_routes_reject_missing_and_user_tokens(client, path, method, kwargs):
+    request = getattr(client, method)
+    assert request(path, **kwargs).status_code == 401
+    assert request(path, headers=bearer(USER_1_TOKEN), **kwargs).status_code == 403
+
+
+def test_admin_token_passes_boundary(client):
+    # Service globals are intentionally uninitialized; 503 means auth passed.
+    assert client.post("/skills/reload", headers=bearer(ADMIN_TOKEN)).status_code == 503
+    assert client.post("/eval/run", headers=bearer(ADMIN_TOKEN)).status_code == 503
+
+
+def test_admin_can_list_update_and_delete_knowledge_documents(client, monkeypatch):
+    class Knowledge:
+        def __init__(self):
+            self.content = "旧内容"
+
+        async def search_handler(self, params, context):
+            return []
+
+        async def list_documents_async(self):
+            return [{"document_id": "doc-1", "title": "VPN", "chunk_count": 1}]
+
+        async def get_document_async(self, document_id):
+            if document_id != "doc-1":
+                return None
+            return {"document_id": document_id, "title": "VPN", "content": self.content}
+
+        def upsert_document(self, title, content):
+            self.content = content
+            return {"document_id": "doc-1", "title": title, "status": "updated"}
+
+        async def delete_document_async(self, document_id):
+            return document_id == "doc-1"
+
+    knowledge = Knowledge()
+    monkeypatch.setattr(main, "_tool_manager", SimpleNamespace(_tools={
+        "knowledge_search": SimpleNamespace(handler=knowledge.search_handler)
+    }))
+    headers = bearer(ADMIN_TOKEN)
+    assert client.get("/knowledge/documents", headers=headers).json()["documents"][0]["title"] == "VPN"
+    assert client.get("/knowledge/documents/doc-1", headers=headers).json()["content"] == "旧内容"
+    assert client.put("/knowledge/documents/doc-1", headers=headers,
+                      json={"title": "其他", "content": "新版"}).status_code == 400
+    result = client.put("/knowledge/documents/doc-1", headers=headers,
+                        json={"title": "VPN", "content": "新版"})
+    assert result.status_code == 200 and result.json()["status"] == "updated"
+    assert client.get("/knowledge/documents/doc-1", headers=headers).json()["content"] == "新版"
+    assert client.delete("/knowledge/documents/doc-1", headers=headers).json()["deleted"] is True
+    assert client.delete("/knowledge/documents/missing", headers=headers).status_code == 404
+
+
+def test_chat_identity_is_bound_to_token(client):
+    payload = {"message": "VPN 不通", "user_id": "u2"}
+    assert client.post("/chat", json=payload, headers=bearer(USER_1_TOKEN)).status_code == 403
+    payload["user_id"] = "u1"
+    assert client.post("/chat", json=payload, headers=bearer(USER_1_TOKEN)).status_code == 503
+    assert client.post("/chat", json=payload).status_code == 401
+
+
+@pytest.mark.parametrize("path,method", [
+    ("/search?query=vpn", "post"),
+    ("/knowledge/stats", "get"),
+    ("/trace/tool/abc", "get"),
+])
+def test_user_routes_reject_missing_tokens(client, path, method):
+    assert getattr(client, method)(path).status_code == 401
+
+
+def test_cors_allows_local_frontend_but_not_other_origins(client):
+    headers = {"Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization"}
+    allowed = client.request("OPTIONS", "/chat", headers={**headers, "Origin": "http://localhost:5174"})
+    denied = client.request("OPTIONS", "/chat", headers={**headers, "Origin": "https://other.example"})
+    assert allowed.status_code == 200
+    assert denied.status_code == 400
+
+
+def test_archive_identity_is_bound_to_token(client, monkeypatch):
+    class Memory:
+        async def archive_conversation(self, user_id, conv_id):
+            return {"archived": True, "user_id": user_id, "conv_id": conv_id}
+
+    monkeypatch.setattr(main, "_memory", Memory())
+    payload = {"user_id": "u2", "conv_id": "c1"}
+    assert client.post("/conversation/archive", json=payload, headers=bearer(USER_1_TOKEN)).status_code == 403
+    payload.pop("user_id")
+    response = client.post("/conversation/archive", json=payload, headers=bearer(USER_1_TOKEN))
+    assert response.status_code == 200
+    assert response.json()["user_id"] == "u1"
+
+
+def test_tool_trace_is_visible_only_to_its_owner(client, monkeypatch):
+    class Orchestrator:
+        def get_tool_trace(self, request_id):
+            return {"request_id": request_id, "user_id": "u1", "tool_calls": [{"input": "private"}]}
+
+    monkeypatch.setattr(main, "_orchestrator", Orchestrator())
+    own = client.get("/trace/tool/abc", headers=bearer(USER_1_TOKEN))
+    other = client.get("/trace/tool/abc", headers=bearer(USER_2_TOKEN))
+    assert own.status_code == 200 and own.json()["found"] is True
+    assert other.status_code == 200 and other.json() == {"request_id": "abc", "found": False, "trace": {}}
+
+
+def test_orchestrator_records_trace_owner():
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator._recent_tool_traces = deque(maxlen=2)
+    result = OrchestratorResult(request_id="abc", response="ok", agent_type=AgentType.GENERAL, intent=None)
+    orchestrator._record_tool_trace(result, "u1")
+    assert orchestrator.get_tool_trace("abc")["user_id"] == "u1"

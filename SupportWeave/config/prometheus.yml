@@ -1,0 +1,26 @@
+# Prometheus 配置文件 — SupportWeave 企业 IT 服务 Agent
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'supportweave'
+    environment: 'demo'
+
+rule_files:
+  - "alerts/*.yml"
+
+scrape_configs:
+  # SupportWeave 主应用指标
+  - job_name: 'supportweave-app'
+    static_configs:
+      - targets: ['supportweave:8000']
+        labels:
+          service: 'supportweave'
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+
+  # Prometheus 自监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
